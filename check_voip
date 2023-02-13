@@ -11,8 +11,6 @@ use WWW::Curl;
 use WWW::Curl::Easy;
 use Data::Dumper;
 
-use constant VERNUM => 2012092808;
-
 # globals
 use vars qw(
   $PROGNAME $VERSION $opt_version $opt_help $opt_host $opt_port $opt_proto
