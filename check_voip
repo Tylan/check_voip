@@ -1,0 +1,284 @@
+#!/usr/bin/perl -w
+
+use strict;
+use lib qw ( /usr/local/nagios/libexec /usr/lib/nagios/plugins /usr/lib64/nagios/plugins );
+use utils qw( %ERRORS $TIMEOUT &print_revision &support &usage );
+use Getopt::Long;
+use Net::Ping;
+use Time::HiRes;
+use List::Util qw(max min);
+use WWW::Curl;
+use WWW::Curl::Easy;
+use Data::Dumper;
+
+use constant VERNUM => 2012092808;
+
+# globals
+use vars qw(
+  $PROGNAME $VERSION $opt_version $opt_help $opt_host $opt_port $opt_proto
+  $opt_mode
+);
+
+my $EXITSTRING = "";
+my $state = "";
+my $noret = 0;
+my ($px,$psum,$ploss,$tval,$jitter,$eff_latency);
+my @pvals;
+
+my %STATUS_CODE =
+  ( 'UNKNOWN' => '3', 'OK' => '0', 'WARNING' => '1', 'CRITICAL' => '2' );
+
+# config
+$PROGNAME    = $0;
+$VERSION     = '1.0.0';
+
+# init options
+$opt_version     = undef;
+$opt_help        = undef;
+$opt_host        = undef;
+$opt_mode        = undef;
+$opt_proto       = "icmp";
+$opt_port        = undef;
+
+# get options
+Getopt::Long::Configure('bundling');
+GetOptions(
+  'V|version'           => \$opt_version,
+  'h|help'              => \$opt_help,
+  'H|host=s'            => \$opt_host,
+  'm|mode=s'            => \$opt_mode,
+  'p|port=s'            => \$opt_port,
+  'P|proto=s'           => \$opt_proto
+) or do {
+  print_usage();
+  exit($ERRORS{'UNKNOWN'});
+};
+
+if ($opt_version) {
+  print_version();
+  exit($ERRORS{'UNKNOWN'});
+}
+
+if ($opt_help) {
+  print_help();
+  exit($ERRORS{'UNKNOWN'});
+}
+
+if (!$opt_host) {
+  print "Host option not given\n";
+  print_usage();
+  exit($ERRORS{'UNKNOWN'});
+}
+
+if (!$opt_mode) {
+  print "Check mode needs to be specified\n";
+  print_usage();
+  exit($ERRORS{'UNKNOWN'});
+}
+
+if (((lc($opt_proto) eq "tcp") or (lc($opt_proto) eq "udp")) and (!$opt_port)) {
+  print "Port needs to be given if using TCP or UDP protocols.\n";
+  print_usage();
+  exit($ERRORS{'UNKNOWN'});
+}
+
+sub print_usage {
+  my $tab = ' ' x length($PROGNAME);
+  print <<EOB
+Usage:
+ check_jitter -H host -m mode -P protocol [-p port]
+ check_jitter --version
+ check_jitter --help
+EOB
+}
+
+sub print_version {
+  print_revision($PROGNAME, $VERSION);
+}
+
+sub print_help {
+  print_version();
+  print <<EOB;
+
+Check a jitter of remote host.
+
+EOB
+
+  print_usage();
+  print <<EOB;
+
+Required Arguments:
+ -H, --host=HOST
+    The name or address of the host to check jitter against.
+ -m, --mode=MODE
+    The mode for which to check VOIP (mos, jitter).
+ -P, --proto=PROTO
+    The protocol to test jitter against (icmp, udp, tcp) (Default: icmp).
+ -p, --port=PORT
+    The port to test against (if using udp or tcp).
+
+EOB
+}
+
+
+sub PING {
+    my ($ret,$dur,$ip,$count,$bytes,$time);
+    my @bytes = qw(8 12 16 32 64 128 256 512 768 1024);
+
+    foreach $bytes (@bytes) {
+        for ($count = 25; $count >= 1; $count--) {
+            my $p = Net::Ping->new($opt_proto, "1", $bytes);
+            $p->hires();
+            if ((lc($opt_proto) eq "tcp") or (lc($opt_proto) eq "udp")) {
+                $p->port_number($opt_port);
+            }
+            ($ret, $dur, $ip) = $p->ping($opt_host);
+            if (defined $ret) {
+                if ($ret == 0) {
+                    $noret++;
+                    $p->close();
+                    next;
+                } else {
+                    $time = (1000 * $dur);
+                }
+                push(@pvals, (1000 * $dur));
+                $p->close();
+            }
+        }
+    }
+}
+
+sub JITTER {
+    my ($maxv,$minv);
+
+    if (@pvals) {
+        foreach $px (@pvals) {
+            $psum += $px;
+        }
+
+        $tval = scalar(@pvals);
+        $maxv = max(@pvals);
+        $minv = min(@pvals);
+        $jitter = ($maxv-$minv)/($tval - 1);
+
+        if (lc($opt_mode) eq 'jitter') {
+            $state = "OK";
+            $EXITSTRING = "$state - ".$jitter."ms|Jitter=".$jitter."ms;;;;";
+        }
+    } else {
+        $state = "CRITICAL";
+        if ($opt_port) {
+            $EXITSTRING = "$state - Host was not reachable on ". uc($opt_proto). "\\$opt_port.";
+        } else {
+            $EXITSTRING = "$state - Host was not reachable.";
+        }
+    }
+}
+
+sub EFFECTIVE_LATENCY {
+    my ($pavg);
+
+    JITTER();
+    $pavg = ($psum/$tval);
+
+    $ploss = (($noret/250) * 100);
+    $eff_latency = ($pavg+($jitter*2)+10);
+
+    if (lc($opt_mode) eq 'latency') {
+        $state = "OK";
+        $EXITSTRING = "$state - ".$eff_latency."ms|VOIP Latency=".$eff_latency."ms;;;;";
+    }
+    if (lc($opt_mode) eq 'ploss') {
+        $state = "OK";
+        $EXITSTRING = "$state - " . $ploss . "%|Packet Loss=" . $ploss . "%;5;15;0;100";
+    }
+}
+
+sub MOS {
+    my ($mos,$mosR,$mosgrade);
+
+    EFFECTIVE_LATENCY();
+
+    if ($eff_latency < 160) {
+        $mosR = (93.2-($eff_latency/40));
+    } else {
+        $mosR = (93.2-($eff_latency-120)/10);
+    }
+
+    $mosR = ($mosR-($ploss*2.5));
+
+    if ($mosR < 0) {
+        $mos = 1;
+    } elsif ($mosR > 100) {
+        $mos = 4.5;
+    } else {
+        $mos = (1+(0.035*$mosR)+(.000007*$mosR)*($mosR-60)*(100-$mosR));
+    }
+
+    $mos = sprintf("%.2f", $mos);
+
+    if ($mos >= 4.30) {
+        $mosgrade = 'A';
+        $state = "OK";
+    } elsif ($mos >= 4.19) {
+        $mosgrade = "B";
+        $state = "OK";
+    } elsif ($mos >= 3.99) {
+        $mosgrade = "C";
+        $state = "WARNING";
+    } elsif ($mos >= 3.59) {
+        $mosgrade = "D";
+        $state = "WARNING";
+    } elsif ($mos >= 3.09) {
+        $mosgrade = "E";
+        $state = "CRITICAL";
+    } elsif ($mos < 3.09) {
+        $mosgrade = "F";
+        $state = "CRITICAL";
+    }
+    $EXITSTRING = "$state - $mos - Grade: [$mosgrade]|MOS=$mos;4:;3.09:;0;5";
+}
+
+sub CURL {
+    my $curl = WWW::Curl::Easy->new;
+    my $cstart = time();
+    my ($fsize,$timedif,$c_spd);
+
+    $curl->setopt(CURLOPT_HEADER,1);
+    $curl->setopt(CURLOPT_URL, 'http://speedtest.wdc01.softlayer.com/downloads/test100.zip');
+
+    my $response_body;
+    $curl->setopt(CURLOPT_WRITEDATA,\$response_body);
+
+    my $retcode = $curl->perform;
+
+    if ($retcode == 0) {
+        $fsize = 104874307;
+    } else {
+        print("ERROR: $retcode ".$curl->strerror($retcode)." ".$curl->errbuf."\n");
+    }
+    my $cend = time();
+    $timedif = ($cend-$cstart);
+    $c_spd = int((((($fsize/$timedif)/1000)/1000)*8));
+    printf ("SPEED: $c_spd mbps\n");
+}
+
+sub stop {
+    my $result = shift;
+    my $exit_code = shift;
+    print $result . "\n";
+    exit ( $STATUS_CODE{$exit_code} );
+}
+PING();
+if (lc($opt_mode) eq 'mos') {
+    MOS();
+}
+elsif (lc($opt_mode) eq 'jitter') {
+    JITTER();
+}
+elsif ((lc($opt_mode) eq 'latency') or (lc($opt_mode) eq 'ploss')) {
+    EFFECTIVE_LATENCY();
+}
+#CURL();
+
+stop($EXITSTRING, $state);
